@@ -72,7 +72,16 @@ struct http_state {
 
 using http_broker = caf::stateful_actor<http_state, broker>;
 
-behavior http_worker(http_broker* self, connection_handle hdl) {
+behavior another_actor(event_based_actor* self) {
+  return {[=](const std::string& req) {
+    if (req == http_valid_get)
+      return make_message(pong_atom_v, http_ok);
+    else
+      return make_message(pong_atom_v, http_error);
+  }};
+}
+
+behavior http_worker(http_broker* self, connection_handle hdl, const actor &pong) {
   // tell network backend to receive any number of bytes between 1 and 1024
   self->configure_read(hdl, receive_policy::at_most(1024));
   return {
@@ -129,33 +138,45 @@ behavior http_worker(http_broker* self, connection_handle hdl) {
       // we have received the HTTP header if we have an empty line at the
       // end
       if (lines.size() > 1 && lines.back().empty()) {
-        auto& out = self->wr_buf(hdl);
-        auto append = [&](string_view str) {
-          auto bytes = as_bytes(make_span(str));
-          out.insert(out.end(), bytes.begin(), bytes.end());
-        };
+        //        auto& out = self->wr_buf(hdl);
+        //        auto append = [&](string_view str) {
+        //          auto bytes = as_bytes(make_span(str));
+        //          out.insert(out.end(), bytes.begin(), bytes.end());
+        //        };
         // we only look at the first line in our example and reply with
         // our OK message if we receive exactly "GET / HTTP/1.1",
         // otherwise we send a 404 HTTP response
-        if (lines.front() == http_valid_get)
-          append(http_ok);
-        else
-          append(http_error);
+        //        if (lines.front() == http_valid_get)
+        //          append(http_ok);
+        //        else
+        //          append(http_error);
         // write data and close connection
-        self->flush(hdl);
-        self->quit();
+        //        self->flush(hdl);
+        //        self->quit();
+        self->send(pong, lines.front());
       }
+    },
+    [=](pong_atom, const std::string& res) {
+      auto& out = self->wr_buf(hdl);
+      auto append = [&](string_view str) {
+        auto bytes = as_bytes(make_span(str));
+        out.insert(out.end(), bytes.begin(), bytes.end());
+      };
+      append(res);
+      // write data and close connection
+      self->flush(hdl);
+      self->quit();
     },
     [=](const connection_closed_msg&) { self->quit(); },
   };
 }
 
-behavior server(broker* self) {
+behavior server(broker* self, const actor &pong) {
   CAF_MESSAGE("server up and running");
   return {
     [=](const new_connection_msg& ncm) {
       CAF_MESSAGE("fork on new connection");
-      self->fork(http_worker, ncm.handle);
+      self->fork(http_worker, ncm.handle, pong);
     },
   };
 }
@@ -167,8 +188,9 @@ public:
   fixture() : system(cfg.load<io::middleman, network::test_multiplexer>()) {
     mpx_ = dynamic_cast<multiplexer_type*>(&system.middleman().backend());
     CAF_REQUIRE(mpx_ != nullptr);
+    auto pong = system.spawn(another_actor);
     // spawn the actor-under-test
-    aut_ = system.middleman().spawn_broker(server);
+    aut_ = system.middleman().spawn_broker(server, pong);
     // assign the acceptor handle to the AUT
     aut_ptr_ = static_cast<abstract_broker*>(actor_cast<abstract_actor*>(aut_));
     aut_ptr_->add_doorman(mpx_->new_doorman(acceptor_, 1u));
